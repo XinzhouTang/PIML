@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-用已训练好的 RheoHybridModel.joblib
-直接验证 Rheo_GT100_Validation.csv
+Validate Rheo_GT100_Validation.csv
+using the trained RheoHybridModel.joblib
 """
 
 import __main__
 from train_piml import RheoConfig, RheoHybridModel
 
-# 为 joblib 反序列化提供类定义
+# Provide class definitions for joblib deserialization
 __main__.RheoConfig = RheoConfig
 __main__.RheoHybridModel = RheoHybridModel
 
@@ -17,6 +17,7 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
 
 def calc_mape(y_true, y_pred, eps=1e-12):
+    """Compute mean absolute percentage error (MAPE)."""
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     return float(np.mean(np.abs((y_pred - y_true) / (y_true + eps))) * 100.0)
@@ -27,25 +28,25 @@ if __name__ == "__main__":
     val_path = "Rheo_GT100_Validation.csv"
     out_path = "Rheo_GT100_Validation_Result.csv"
 
-    print(">>> 加载模型...")
+    print(">>> Loading model ...")
     model = RheoHybridModel.load(model_path, verbose=True)
 
-    print(">>> 读取验证集...")
+    print(">>> Reading validation dataset ...")
     df_val = pd.read_csv(val_path)
 
     required_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]
     for c in required_cols:
         if c not in df_val.columns:
-            raise ValueError(f"验证文件缺少必要列: {c}")
+            raise ValueError(f"Validation file is missing a required column: {c}")
 
-    # 只保留 T > 100 的样本
+    # Keep only samples with T > 100°C
     df_val = df_val[df_val["T"] > 100].copy()
-    print(f">>> 高温验证样本数: {len(df_val)}")
+    print(f">>> Number of high-temperature validation samples: {len(df_val)}")
 
     if len(df_val) == 0:
-        raise ValueError("Rheo_GT100_Validation.csv 里没有 T > 100 的数据。")
+        raise ValueError("No samples with T > 100°C were found in Rheo_GT100_Validation.csv.")
 
-    print(">>> 开始预测...")
+    print(">>> Running prediction ...")
     eta_pred = model.predict(
         df_val[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
     )
@@ -70,13 +71,13 @@ if __name__ == "__main__":
 
     df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    print("\n>>> 验证结果（T > 100℃）")
+    print("\n>>> Validation results (T > 100°C)")
     print(f"MSE      = {mse:.6e}")
     print(f"R2       = {r2:.6f}")
     print(f"MAE      = {mae:.6e}")
-    print(f"MAPE(%)  = {mape:.4f}")
+    print(f"MAPE (%) = {mape:.4f}")
     print(f"Log-R2   = {log_r2:.6f}")
     print(f"Log-MAE  = {log_mae:.6f}")
     print(f"Log-RMSE = {log_rmse:.6f}")
 
-    print(f"\n>>> 已保存结果文件: {out_path}")
+    print(f"\n>>> Result file saved to: {out_path}")

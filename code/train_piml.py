@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-PIML（精简版，保留高温验证能力）
-------------------------------------------------
-功能：
-  1) 用 Arrhenius aT 引入温度（定义：低温 aT > 1）
-  2) 用 Carreau–Yasuda(CY) 作为物理基线：eta_theory(gamma, T)
-  3) 随机森林学习 log 空间残差：res = log10(eta) - log10(eta_theory)
-  4) 支持温度不平衡权重 sample_weight，并做权重封顶
-  5) 保留高温分段 p_eta0，用于 >100℃ 外推/验证
-  6) 预处理后自动保存 T>100 的数据到单独 csv
-  7) 只用 T<=100 的数据进行训练和测试
-
-说明：
-  - 为保持物理层参数稳定性，并与原始建模口径一致，
-    先用全部 T<=100℃ 数据拟合 CY 参数和全局活化能 E，
-    再仅用训练集训练随机森林残差模型。
+Physics-Informed Machine Learning (PIML) for Rheology Modeling
+----------------------------------------------------------------
+Main features:
+1) Introduce temperature through the Arrhenius shift factor aT
+   (definition: at lower temperature, aT > 1)
+2) Use the Carreau–Yasuda (CY) model as the physics-based baseline:
+   eta_theory(gamma, T)
+3) Train a random forest on log-space residuals:
+   residual = log10(eta) - log10(eta_theory)
+4) Support temperature-imbalance sample weighting with capped weights
+5) Preserve segmented high-temperature p_eta0 for extrapolation
+   and validation above 100°C
+6) Automatically save T > 100°C data to a separate CSV after preprocessing
+7) Use only T <= 100°C data for training and testing
 """
 
 import warnings
@@ -35,18 +34,23 @@ import joblib
 
 
 # ==============================================================================
-# 物理公式
+# Physics formulas
 # ==============================================================================
 
 class PhysicsFormulas:
-    """物理公式集合"""
+    """Collection of rheology-related physics formulas."""
     R = 8.314  # J/mol/K
 
     @staticmethod
     def arrhenius_log10_aT(T_K: np.ndarray, E: float, Tref_K: float) -> np.ndarray:
         """
-        定义：低温 aT > 1
-        log10(aT) = +(E / (R * ln(10))) * (1/T - 1/Tref)
+        Arrhenius shift factor in log10 form.
+
+        Definition:
+            at lower temperature, aT > 1
+
+        Formula:
+            log10(aT) = +(E / (R * ln(10))) * (1/T - 1/Tref)
         """
         T_K = np.asarray(T_K, dtype=float)
         return (E / (PhysicsFormulas.R * np.log(10.0))) * ((1.0 / T_K) - (1.0 / Tref_K))
@@ -59,8 +63,10 @@ class PhysicsFormulas:
                            n: float,
                            a: float) -> np.ndarray:
         """
-        Carreau–Yasuda 模型：
-        eta(gamma) = eta_inf + (eta0 - eta_inf) * (1 + (lam*gamma)^a)^((n-1)/a)
+        Carreau–Yasuda model:
+
+            eta(gamma) = eta_inf + (eta0 - eta_inf) *
+                         (1 + (lam * gamma)^a)^((n - 1) / a)
         """
         g = np.asarray(gamma, dtype=float) + 1e-12
         eta0 = np.asarray(eta0, dtype=float)
@@ -71,48 +77,49 @@ class PhysicsFormulas:
 
 
 # ==============================================================================
-# 配置
+# Configuration
 # ==============================================================================
 
 @dataclass
 class RheoConfig:
-    # 全局参考温度（用于 aT_global 特征）
+    # Global reference temperature used for the aT_global feature
     Tref_c: float = 25.0
 
-    # 高温分段 p_eta0（用于 >100℃ 预测/验证）
+    # Segmented p_eta0 for high-temperature prediction / validation
     p_eta0_low: float = 1.0
     p_eta0_high: float = 0.75
     p_eta0_highT: float = 100.0
 
-    # 活化能 E 默认值（拟合失败时兜底）
+    # Default activation energy E (fallback if fitting fails)
     default_E: float = 5.0e4  # J/mol
     fit_E_from_data: bool = True
     E_min: float = 8.0e3
     E_max: float = 2.0e5
 
-    # 温度不平衡权重
+    # Temperature imbalance weighting
     use_temp_weights: bool = True
     weight_mode: str = "inv_sqrt"   # "inv", "inv_sqrt", "none"
     max_weight_ratio: float = 80.0
 
-    # 特征是否包含原始温度 T
+    # Whether to include raw temperature T as a feature
     include_raw_T_feature: bool = False
 
-    # 过滤过小黏度
+    # Filter out very small viscosity values
     eta_min_keep: float = 0.5
 
-    # 是否打印预测时缺失配方参数的警告
+    # Whether to warn when formulation parameters are missing
     show_missing_formula_warning: bool = True
 
-    # ===== 恢复：plateau 区识别 + 高温残差下限 =====
+    # Plateau-region identification + high-temperature residual floor
     plateau_gamma_abs: float = 1e-2
     plateau_bottomk: int = 5
     res_floor_apply_Tmin: float = 100.0
     res_floor_highT: float = -0.02
     use_plateau_res_floor: bool = True
 
+
 # ==============================================================================
-# 主模型
+# Main hybrid model
 # ==============================================================================
 
 class RheoHybridModel:
@@ -124,14 +131,14 @@ class RheoHybridModel:
 
         self.encoders: Dict[str, LabelEncoder] = {}
 
-        # 每个配方 (Salt, Cs, fs, Cp) 对应的 CY 参考参数
+        # Reference CY parameters for each formulation (Salt, Cs, fs, Cp)
         self.rheo_cy_params: Dict[Tuple[str, float, float, float], Dict[str, float]] = {}
 
-        # Arrhenius 参数
+        # Arrhenius parameters
         self.rheo_E: float = rheo_cfg.default_E
         self.rheo_Tref0: float = rheo_cfg.Tref_c + 273.15
 
-        # 随机森林残差模型
+        # Random-forest residual model
         self.rheo_ml = RandomForestRegressor(
             n_estimators=500,
             max_depth=None,
@@ -140,7 +147,7 @@ class RheoHybridModel:
         )
 
     # --------------------------------------------------------------------------
-    # 工具：控制输出
+    # Logging utility
     # --------------------------------------------------------------------------
 
     def _log(self, msg: str) -> None:
@@ -148,7 +155,7 @@ class RheoHybridModel:
             print(msg)
 
     # --------------------------------------------------------------------------
-    # 类别编码：Salt
+    # Categorical preprocessing
     # --------------------------------------------------------------------------
 
     def _preprocess_cat(self, df: pd.DataFrame, is_training: bool) -> pd.DataFrame:
@@ -161,7 +168,7 @@ class RheoHybridModel:
         else:
             le = self.encoders.get("Salt", None)
             if le is None:
-                raise RuntimeError("模型尚未训练，缺少 Salt 编码器。")
+                raise RuntimeError("Model has not been trained. Missing Salt encoder.")
 
             classes = set(le.classes_.tolist())
 
@@ -176,7 +183,7 @@ class RheoHybridModel:
         return df_proc
 
     # --------------------------------------------------------------------------
-    # 计算 aT
+    # Temperature shift factor
     # --------------------------------------------------------------------------
 
     def _get_aT(self, T_c: np.ndarray, E: float, Tref_K: float) -> np.ndarray:
@@ -185,18 +192,20 @@ class RheoHybridModel:
         return np.power(10.0, log10_aT)
 
     # --------------------------------------------------------------------------
-    # 拟合物理参数
+    # Physics fitting
     # --------------------------------------------------------------------------
 
     def fit_physics(self, df: pd.DataFrame) -> None:
         """
-        用给定流变数据拟合：
-          1) 每个配方的 CY 参数
-          2) 全局活化能 E（可选）
+        Fit the following from rheology data:
+        1) CY parameters for each formulation
+        2) Global activation energy E (optional)
 
-        通常建议传入全部 T<=100 数据，以保持与原始建模口径一致。
+        Recommended usage:
+            pass in all T <= 100°C data to remain consistent with
+            the intended modeling protocol.
         """
-        self._log(">>> 拟合流变物理参数（CY + E）...")
+        self._log(">>> Fitting rheology physics parameters (CY + E) ...")
 
         df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
@@ -207,9 +216,9 @@ class RheoHybridModel:
             E_fit = self._fit_E_from_data(df)
             if E_fit is not None:
                 self.rheo_E = E_fit
-                self._log(f">>> 拟合得到全局活化能 E = {self.rheo_E:.4e} J/mol")
+                self._log(f">>> Fitted global activation energy E = {self.rheo_E:.4e} J/mol")
             else:
-                self._log(f">>> 活化能 E 拟合失败，使用默认值 = {self.rheo_E:.4e} J/mol")
+                self._log(f">>> Activation energy fitting failed. Using default E = {self.rheo_E:.4e} J/mol")
 
     def _fit_carreau_yasuda_params(self, df: pd.DataFrame) -> None:
         self.rheo_cy_params = {}
@@ -276,7 +285,7 @@ class RheoHybridModel:
             }
 
     # --------------------------------------------------------------------------
-    # 拟合全局活化能 E
+    # Global activation energy fitting
     # --------------------------------------------------------------------------
 
     def _fit_E_from_data(self, df: pd.DataFrame) -> Optional[float]:
@@ -363,7 +372,7 @@ class RheoHybridModel:
         return E_fit
 
     # --------------------------------------------------------------------------
-    # 物理基线
+    # Physics baseline
     # --------------------------------------------------------------------------
 
     def _theory_eta_batch(self, df: pd.DataFrame) -> np.ndarray:
@@ -380,7 +389,7 @@ class RheoHybridModel:
             if p is None:
                 if self.rheo_cfg.show_missing_formula_warning and self.verbose:
                     print(
-                        "[WARN] 找不到 CY 配方参数："
+                        "[WARN] Missing CY formulation parameters: "
                         f"Salt={salt}, Cs={Cs}, fs={fs}, Cp={Cp}"
                     )
                 eta0_ref, eta_inf, lam_ref, n, a = 1.0, 0.0, 1.0, 0.5, 2.0
@@ -398,7 +407,7 @@ class RheoHybridModel:
 
             aT = self._get_aT(T_arr, self.rheo_E, Tref_K)
 
-            # 保留高温外推能力
+            # Preserve high-temperature extrapolation capability
             p_eta0 = np.full_like(aT, fill_value=self.rheo_cfg.p_eta0_low, dtype=float)
             p_eta0[T_arr >= self.rheo_cfg.p_eta0_highT] = self.rheo_cfg.p_eta0_high
 
@@ -411,7 +420,7 @@ class RheoHybridModel:
         return eta_out
 
     # --------------------------------------------------------------------------
-    # 样本权重
+    # Sample weighting
     # --------------------------------------------------------------------------
 
     def _compute_sample_weight(self, df_feat: pd.DataFrame) -> Optional[np.ndarray]:
@@ -439,9 +448,10 @@ class RheoHybridModel:
 
     def _make_plateau_mask(self, df_feat: pd.DataFrame) -> np.ndarray:
         """
-        plateau 区识别：
+        Identify the plateau region using:
         1) Gamma <= plateau_gamma_abs
-        2) 每条 (Salt_raw, Cs, fs, Cp, T) 曲线中，Gamma 最小的 bottomk 个点
+        2) The bottom-k smallest Gamma points in each curve defined by
+           (Salt_raw, Cs, fs, Cp, T)
         """
         n = len(df_feat)
         if n == 0:
@@ -466,12 +476,13 @@ class RheoHybridModel:
             mask_bottomk[chosen] = True
 
         return mask_abs | mask_bottomk
+
     # --------------------------------------------------------------------------
-    # 数据预处理
+    # Data preprocessing
     # --------------------------------------------------------------------------
 
     def preprocess_data(self, df_raw: pd.DataFrame, save_path: str = "Rheo_Processed.csv") -> pd.DataFrame:
-        self._log(">>> 流变数据预处理 ...")
+        self._log(">>> Preprocessing rheology data ...")
 
         df = df_raw.copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
@@ -483,19 +494,22 @@ class RheoHybridModel:
         )
 
         df_proc.to_csv(save_path, index=False, encoding="utf-8-sig")
-        self._log(f"    已保存预处理后的流变数据到：{save_path}")
+        self._log(f"    Preprocessed rheology data saved to: {save_path}")
         return df_proc
 
     # --------------------------------------------------------------------------
-    # 训练
+    # Training
     # --------------------------------------------------------------------------
 
     def train(self, df_train: pd.DataFrame) -> Tuple[float, float]:
         """
-        这里只训练 RF 残差模型。
-        物理参数（CY/E）应提前通过 fit_physics() 用全部 T<=100 数据拟合。
+        Train only the random-forest residual model.
+
+        Notes:
+            Physics parameters (CY / E) should be fitted beforehand
+            using fit_physics() on all T <= 100°C data.
         """
-        self._log(">>> [Rheo] 训练 ...")
+        self._log(">>> [Rheo] Training ...")
 
         df_train = df_train.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
         df_train = df_train[df_train["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
@@ -514,7 +528,7 @@ class RheoHybridModel:
         y_log = np.log10(df_ml["Eta"].values + 1e-12)
         y_res = y_log - df_ml["Log_Eta_Theory"].values
 
-        # ===== 恢复：高温 plateau 区残差下限 =====
+        # Apply residual floor in the high-temperature plateau region
         if self.rheo_cfg.use_plateau_res_floor:
             mask_plateau = self._make_plateau_mask(df_feat)
             T_vals = df_ml["T"].astype(float).values
@@ -526,6 +540,7 @@ class RheoHybridModel:
                     y_res[mask_apply],
                     float(self.rheo_cfg.res_floor_highT)
                 )
+
         aT_global = self._get_aT(
             df_ml["T"].values.astype(float),
             self.rheo_E,
@@ -558,7 +573,7 @@ class RheoHybridModel:
         return float(mse), float(r2)
 
     # --------------------------------------------------------------------------
-    # 预测
+    # Prediction
     # --------------------------------------------------------------------------
 
     def predict(self, df_test: pd.DataFrame) -> np.ndarray:
@@ -597,7 +612,7 @@ class RheoHybridModel:
         return eta_pred
 
     # --------------------------------------------------------------------------
-    # 保存 / 加载
+    # Save / load
     # --------------------------------------------------------------------------
 
     def save(self, path: str = "RheoHybridModel.joblib") -> None:
@@ -625,7 +640,7 @@ class RheoHybridModel:
 
 
 # ==============================================================================
-# 主程序
+# Main script
 # ==============================================================================
 
 if __name__ == "__main__":
@@ -634,17 +649,17 @@ if __name__ == "__main__":
 
     model = RheoHybridModel(
         rheo_cfg=RheoConfig(
-            # 高温分段
+            # High-temperature segmentation
             p_eta0_low=1.0,
             p_eta0_high=0.65,
             p_eta0_highT=100.0,
 
-            # 活化能 E 拟合
+            # Activation energy fitting
             fit_E_from_data=True,
             E_min=8000.0,
             E_max=2.0e5,
 
-            # 温度样本不平衡加权
+            # Temperature imbalance weighting
             use_temp_weights=True,
             weight_mode="inv_sqrt",
             max_weight_ratio=80.0,
@@ -653,7 +668,7 @@ if __name__ == "__main__":
             eta_min_keep=0.5,
             show_missing_formula_warning=True,
 
-            # ===== 恢复：plateau + 高温残差下限 =====
+            # Plateau-region settings + high-temperature residual floor
             plateau_gamma_abs=1e-2,
             plateau_bottomk=5,
             res_floor_apply_Tmin=100.0,
@@ -662,17 +677,20 @@ if __name__ == "__main__":
         ),
         verbose=True
     )
-    try:
-        print(">>> 读取 Excel 数据...")
 
-        # 读取流变数据
+    try:
+        print(">>> Reading Excel data ...")
+
+        # Read rheology data
         df_rheo_raw = pd.read_excel(rheo_xlsx_path, header=1)
         df_rheo_raw.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]
 
-        # 1) 预处理
+        # 1) Preprocess data
         df_rheo = model.preprocess_data(df_rheo_raw, save_path="Rheo_Processed.csv")
 
-        # 2) 按温度拆分：T>100 保存做验证，T<=100 用于建模
+        # 2) Split by temperature:
+        #    T > 100°C -> validation
+        #    T <= 100°C -> modeling
         df_rheo_val_gt100 = df_rheo[df_rheo["T"] > 100].copy()
         df_rheo_le100 = df_rheo[df_rheo["T"] <= 100].copy()
 
@@ -682,14 +700,14 @@ if __name__ == "__main__":
             encoding="utf-8-sig"
         )
 
-        print(f">>> 流变数据：T<=100 的训练/测试样本数 = {len(df_rheo_le100)}")
-        print(f">>> 流变数据：T>100 的验证样本数 = {len(df_rheo_val_gt100)}")
-        print(">>> 已保存验证文件：Rheo_GT100_Validation.csv")
+        print(f">>> Number of modeling samples (T <= 100°C): {len(df_rheo_le100)}")
+        print(f">>> Number of high-temperature validation samples (T > 100°C): {len(df_rheo_val_gt100)}")
+        print(">>> Validation file saved: Rheo_GT100_Validation.csv")
 
-        # 3) 先用全部 <=100 数据拟合物理参数
+        # 3) Fit physics parameters using all T <= 100°C data
         model.fit_physics(df_rheo_le100)
 
-        # 4) 按配方分组做 train/test 划分
+        # 4) Train/test split by formulation group
         s_salt = df_rheo_le100["Salt"].astype(str)
         s_Cs = df_rheo_le100["Cs"].map(lambda x: f"{float(x):.8g}")
         s_fs = df_rheo_le100["fs"].map(lambda x: f"{float(x):.8g}")
@@ -702,10 +720,10 @@ if __name__ == "__main__":
         df_rheo_train = df_rheo_le100.iloc[tr_idx].reset_index(drop=True)
         df_rheo_test = df_rheo_le100.iloc[te_idx].reset_index(drop=True)
 
-        # 5) 训练 RF（只用训练集）
+        # 5) Train the RF residual model
         rheo_mse_tr, rheo_r2_tr = model.train(df_rheo_train.copy())
 
-        # 训练集预测
+        # Training-set prediction
         rheo_pred_tr = model.predict(
             df_rheo_train[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
         )
@@ -715,7 +733,7 @@ if __name__ == "__main__":
             df_rheo_train_out["Eta_pred"] - df_rheo_train_out["Eta"]
         ).abs()
 
-        # 测试集预测
+        # Test-set prediction
         rheo_pred_te = model.predict(
             df_rheo_test[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
         )
@@ -728,14 +746,14 @@ if __name__ == "__main__":
             df_rheo_test_out["Eta_pred"] - df_rheo_test_out["Eta"]
         ).abs()
 
-        print(f">>> Rheo Train: MSE={rheo_mse_tr:.4e}, R2={rheo_r2_tr:.4f}")
-        print(f">>> Rheo Test : MSE={rheo_mse_te:.4e}, R2={rheo_r2_te:.4f}")
+        print(f">>> Training results: MSE = {rheo_mse_tr:.4e}, R2 = {rheo_r2_tr:.4f}")
+        print(f">>> Test results:     MSE = {rheo_mse_te:.4e}, R2 = {rheo_r2_te:.4f}")
 
         df_rheo_train_out.to_csv("Rheo_Train_Result.csv", index=False, encoding="utf-8-sig")
         df_rheo_test_out.to_csv("Rheo_Test_Result.csv", index=False, encoding="utf-8-sig")
-        print(">>> 已生成结果文件：Rheo_Train_Result.csv, Rheo_Test_Result.csv")
+        print(">>> Output files saved: Rheo_Train_Result.csv, Rheo_Test_Result.csv")
 
-        # 6) 高温验证集预测
+        # 6) High-temperature validation prediction
         if len(df_rheo_val_gt100) > 0:
             rheo_pred_gt100 = model.predict(
                 df_rheo_val_gt100[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
@@ -751,13 +769,13 @@ if __name__ == "__main__":
                 index=False,
                 encoding="utf-8-sig"
             )
-            print(">>> 已生成高温验证结果文件：Rheo_GT100_Validation_Result.csv")
+            print(">>> High-temperature validation results saved: Rheo_GT100_Validation_Result.csv")
 
-        # 7) 保存模型
+        # 7) Save model
         model.save(model_save_path)
-        print(f">>> 模型已保存到: {model_save_path}")
+        print(f">>> Model saved to: {model_save_path}")
 
     except Exception as e:
         import traceback
-        print(f"\n运行出错: {e}")
+        print(f"\nRuntime error: {e}")
         traceback.print_exc()
