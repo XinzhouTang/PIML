@@ -1,25 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Training script: low-temperature training + low-temperature test evaluation
-------------------------------------------------
+Training script for comparison ML baselines
+-------------------------------------------
 Functions:
-1) Read the raw Excel file
+1) Read the raw training Excel file
 2) Preprocess:
    - keep only rows with Eta > eta_min_keep
    - aggregate by median over (T, Salt, Cs, fs, Cp, Gamma)
-3) Split by temperature:
-   - T <= 100°C -> low-temperature modeling data
-   - T > 100°C  -> high-temperature validation data
-4) On T <= 100°C, perform GroupShuffleSplit at the formulation level (Salt, Cs, fs, Cp)
-   - train_le100
-   - test_le100
-5) Train models only on train_le100
-6) If hyperparameter tuning is enabled, perform GroupKFold inside train_le100 using the same formulation grouping
-7) Evaluate models on train_le100 / test_le100
-8) Save:
+3) Perform GroupShuffleSplit on the full processed training dataset
+   using formulation groups (Salt, Cs, fs, Cp)
+4) Train models only on the training split
+5) If hyperparameter tuning is enabled, perform GroupKFold inside the training split
+6) Evaluate models on train / test
+7) Save:
    - preprocessed data
-   - train/test/validation split files
-   - trained models (still saved as model_name.pkl)
+   - train/test split files
+   - trained models
    - LabelEncoder
    - train/test prediction results and metrics
 """
@@ -54,21 +50,20 @@ from xgboost import XGBRegressor
 
 @dataclass
 class TrainConfig:
-    CODE_DIR = Path(__file__).resolve().parent.parent
-    PROJECT_DIR = CODE_DIR.parent
-    DATA_DIR = PROJECT_DIR / "data"
+    CODE_DIR = Path(__file__).resolve().parent
+    REPO_DIR = CODE_DIR.parent.parent
+    DATA_DIR = REPO_DIR / "data"
 
-    xlsx_path: str = str(DATA_DIR / "Data For PIML Learning.xlsx")
+    xlsx_path: str = str(DATA_DIR / "Rheo_Training_Data.xlsx")
     xlsx_header: int = 1
 
-    base_out_dir: str = "./ml_outputs"
-    model_dir: str = "./ml_models"
+    base_out_dir: str = str(CODE_DIR / "ml_outputs")
+    model_dir: str = str(CODE_DIR / "ml_models")
 
     random_state: int = 0
     use_log_target: bool = True
     eta_min_keep: float = 0.5
 
-    temp_split_threshold: float = 100.0
     outer_test_size: float = 0.2
     inner_cv_splits: int = 5
 
@@ -156,6 +151,8 @@ class DataProcessor:
         self._log("  Preprocessing data...")
 
         df = df_raw.copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
+        df = df[df["Gamma"] > 0].copy()
         df = df[df["Eta"] > float(self.eta_min_keep)].copy()
 
         group_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
@@ -225,12 +222,10 @@ if __name__ == "__main__":
 
     train_out_dir = os.path.join(cfg.base_out_dir, "train")
     test_out_dir = os.path.join(cfg.base_out_dir, "test")
-    val_out_dir = os.path.join(cfg.base_out_dir, "val_gt100")
 
     os.makedirs(cfg.base_out_dir, exist_ok=True)
     os.makedirs(train_out_dir, exist_ok=True)
     os.makedirs(test_out_dir, exist_ok=True)
-    os.makedirs(val_out_dir, exist_ok=True)
     os.makedirs(cfg.model_dir, exist_ok=True)
 
     print("  Reading Excel data...")
@@ -241,64 +236,45 @@ if __name__ == "__main__":
     processed_path = os.path.join(cfg.base_out_dir, "Processed.csv")
     df = processor.preprocess(df_raw, save_path=processed_path)
 
-    # Temperature split
-    df_le100 = df[df["T"] <= cfg.temp_split_threshold].reset_index(drop=True)
-    df_gt100 = df[df["T"] > cfg.temp_split_threshold].reset_index(drop=True)
+    print(f"  Total modeling samples: {len(df)}")
+    if len(df) == 0:
+        raise ValueError("No valid training samples found after preprocessing.")
 
-    print(f"  Low-temperature modeling samples (T <= {cfg.temp_split_threshold}°C): {len(df_le100)}")
-    print(f"  High-temperature validation samples (T > {cfg.temp_split_threshold}°C): {len(df_gt100)}")
-
-    if len(df_le100) == 0:
-        raise ValueError("No samples found with T <= 100.")
-    if len(df_gt100) == 0:
-        raise ValueError("No samples found with T > 100.")
-
-    # GroupShuffleSplit in low-temperature range by formulation group
-    groups_le100 = build_formula_groups(df_le100)
-    n_formula_groups = groups_le100.nunique()
-    print(f"  Number of low-temperature formulation groups: {n_formula_groups}")
+    groups_all = build_formula_groups(df)
+    n_formula_groups = groups_all.nunique()
+    print(f"  Number of formulation groups: {n_formula_groups}")
 
     if n_formula_groups < 2:
-        raise ValueError("Not enough low-temperature formulation groups for GroupShuffleSplit.")
+        raise ValueError("Not enough formulation groups for GroupShuffleSplit.")
 
     gss = GroupShuffleSplit(
         n_splits=1,
         test_size=cfg.outer_test_size,
         random_state=cfg.random_state
     )
-    tr_idx, te_idx = next(gss.split(df_le100, groups=groups_le100))
+    tr_idx, te_idx = next(gss.split(df, groups=groups_all))
 
-    df_train = df_le100.iloc[tr_idx].reset_index(drop=True)
-    df_test = df_le100.iloc[te_idx].reset_index(drop=True)
-    df_val = df_gt100.copy().reset_index(drop=True)
+    df_train = df.iloc[tr_idx].reset_index(drop=True)
+    df_test = df.iloc[te_idx].reset_index(drop=True)
 
-    # Save group information
     df_train["Formula_Group"] = build_formula_groups(df_train).values
     df_test["Formula_Group"] = build_formula_groups(df_test).values
-    df_val["Formula_Group"] = build_formula_groups(df_val).values
 
     df_train["Curve_Group"] = build_curve_groups(df_train).values
     df_test["Curve_Group"] = build_curve_groups(df_test).values
-    df_val["Curve_Group"] = build_curve_groups(df_val).values
 
-    print(f"  Low-temperature training samples train_le100: {len(df_train)}")
-    print(f"  Low-temperature testing samples test_le100 : {len(df_test)}")
-    print(f"  High-temperature validation samples val_gt100 : {len(df_val)}")
+    print(f"  Training samples: {len(df_train)}")
+    print(f"  Testing samples : {len(df_test)}")
 
-    # Save split results
-    train_csv = os.path.join(train_out_dir, "Train_LE100.csv")
-    test_csv = os.path.join(test_out_dir, "Test_LE100.csv")
-    val_csv = os.path.join(val_out_dir, "Val_GT100.csv")
+    train_csv = os.path.join(train_out_dir, "Train.csv")
+    test_csv = os.path.join(test_out_dir, "Test.csv")
 
     df_train.to_csv(train_csv, index=False, encoding="utf-8-sig")
     df_test.to_csv(test_csv, index=False, encoding="utf-8-sig")
-    df_val.to_csv(val_csv, index=False, encoding="utf-8-sig")
 
     print(f"  Training set saved to: {train_csv}")
     print(f"  Test set saved to: {test_csv}")
-    print(f"  Validation set saved to: {val_csv}")
 
-    # Features and target
     feat_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
     y_col = "Eta"
 
@@ -314,15 +290,13 @@ if __name__ == "__main__":
     else:
         y_train_fit = y_train
 
-    # Inner GroupKFold (train_le100 only)
     groups_train_formula = build_formula_groups(df_train)
     cv_splits = min(cfg.inner_cv_splits, groups_train_formula.nunique())
     if cv_splits < 2:
-        raise ValueError("Not enough formulation groups in train_le100 for GroupKFold.")
+        raise ValueError("Not enough formulation groups in training set for GroupKFold.")
 
     kf = GroupKFold(n_splits=cv_splits)
 
-    # Model definitions
     models: Dict[str, Any] = {}
 
     rf_pipe = Pipeline([
@@ -403,12 +377,10 @@ if __name__ == "__main__":
         ("model", LinearRegression())
     ])
 
-    # Save encoder
     encoder_path = os.path.join(cfg.model_dir, "salt_encoder.pkl")
     joblib.dump(fb.le_salt, encoder_path)
     print(f"  Encoder saved to: {encoder_path}")
 
-    # Output containers
     drop_aux_cols = ["Formula_Group", "Curve_Group"]
 
     df_train_all_base = (
@@ -425,11 +397,8 @@ if __name__ == "__main__":
 
     metrics_train_rows = []
     metrics_test_rows = []
-
-    # Cache all model results first, then output in the order ranked by test R2
     result_cache = {}
 
-    # Train, test, and save each model
     for model_name, model in models.items():
         print("\n" + "=" * 90)
         print(f"  Training model: {model_name}")
@@ -447,23 +416,14 @@ if __name__ == "__main__":
             best_model = model
             print(f"  Best params   ({model_name}): default settings")
 
-        # Train prediction
         pred_train_fit = best_model.predict(X_train_df)
-        if cfg.use_log_target:
-            pred_train = np.power(10.0, pred_train_fit)
-        else:
-            pred_train = pred_train_fit
+        pred_train = np.power(10.0, pred_train_fit) if cfg.use_log_target else pred_train_fit
         pred_train = np.maximum(pred_train, 1e-12)
 
-        # Test prediction
         pred_test_fit = best_model.predict(X_test_df)
-        if cfg.use_log_target:
-            pred_test = np.power(10.0, pred_test_fit)
-        else:
-            pred_test = pred_test_fit
+        pred_test = np.power(10.0, pred_test_fit) if cfg.use_log_target else pred_test_fit
         pred_test = np.maximum(pred_test, 1e-12)
 
-        # Train metrics
         train_base = calc_metrics(y_train, pred_train)
         train_mae = mean_absolute_error(y_train, pred_train)
         train_mape = calc_mape(y_train, pred_train)
@@ -481,7 +441,6 @@ if __name__ == "__main__":
             "Log_RMSE": train_log["Log_RMSE"],
         })
 
-        # Test metrics
         test_base = calc_metrics(y_test, pred_test)
         test_mae = mean_absolute_error(y_test, pred_test)
         test_mape = calc_mape(y_test, pred_test)
@@ -500,7 +459,7 @@ if __name__ == "__main__":
         })
 
         print(
-            f"  train_le100: "
+            f"  train: "
             f"R2={train_base['R2']:.4f} | "
             f"RMSE={train_base['RMSE']:.4e} | "
             f"MSE={train_base['MSE']:.4e} | "
@@ -509,7 +468,7 @@ if __name__ == "__main__":
         )
 
         print(
-            f"  test_le100: "
+            f"  test: "
             f"R2={test_base['R2']:.4f} | "
             f"RMSE={test_base['RMSE']:.4e} | "
             f"MSE={test_base['MSE']:.4e} | "
@@ -517,14 +476,12 @@ if __name__ == "__main__":
             f"MAPE={test_mape:.2f}%"
         )
 
-        # Save model (keep original naming by model name)
         save_payload = {
             "best_model": best_model,
             "feature_cols": feat_cols,
             "target_col": y_col,
             "use_log_target": cfg.use_log_target,
             "eta_min_keep": cfg.eta_min_keep,
-            "temp_split_threshold": cfg.temp_split_threshold,
             "group_definition_outer": "(Salt, Cs, fs, Cp)",
             "group_definition_inner": "(Salt, Cs, fs, Cp)",
             "curve_definition": "(Salt, Cs, fs, Cp, T)",
@@ -536,13 +493,11 @@ if __name__ == "__main__":
         joblib.dump(save_payload, model_path)
         print(f"  Model saved to: {model_path}")
 
-        # Cache prediction results; columns will be written later in metrics_test.csv ranking order
         result_cache[model_name] = {
             "pred_train": pred_train,
             "pred_test": pred_test,
         }
 
-    # Save metrics
     metrics_train_csv = os.path.join(train_out_dir, "metrics_train.csv")
     metrics_test_csv = os.path.join(test_out_dir, "metrics_test.csv")
 
@@ -552,7 +507,6 @@ if __name__ == "__main__":
     df_metrics_train.to_csv(metrics_train_csv, index=False, encoding="utf-8-sig")
     df_metrics_test.to_csv(metrics_test_csv, index=False, encoding="utf-8-sig")
 
-    # Write train/test all-model files in the same order as metrics_test.csv
     ordered_models = df_metrics_test["Model"].tolist()
 
     df_train_all = df_train_all_base.copy()
@@ -568,15 +522,8 @@ if __name__ == "__main__":
     df_train_all.to_csv(train_all_csv, index=False, encoding="utf-8-sig")
     df_test_all.to_csv(test_all_csv, index=False, encoding="utf-8-sig")
 
-    pretty_print_metrics_table(
-        df_metrics_train,
-        title="Low-Temperature Train Metrics (train_le100)"
-    )
-
-    pretty_print_metrics_table(
-        df_metrics_test,
-        title="Low-Temperature Test Metrics (test_le100)"
-    )
+    pretty_print_metrics_table(df_metrics_train, title="Train Metrics")
+    pretty_print_metrics_table(df_metrics_test, title="Test Metrics")
 
     print("\n" + "=" * 90)
-    print(" Training done.")
+    print("Training done.")
