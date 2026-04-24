@@ -9,9 +9,6 @@ This script:
 4) Saves:
    - Generalization_AllModels.csv
 
-Important:
-The generalization file has no Eta column,
-so this script only predicts and does NOT compute metrics.
 """
 
 import warnings
