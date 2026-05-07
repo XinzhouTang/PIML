@@ -539,7 +539,7 @@ class RheoHybridModel:
         self._log(f"    Preprocessed rheology data saved to: {save_path}")
         return df_proc
 
-    def train(self, df_train: pd.DataFrame) -> Tuple[float, float]:
+    def train(self, df_train: pd.DataFrame) -> Dict[str, float]:
         """Train the random-forest residual model on the training set."""
         self._log(">>> [Rheo] Training ...")
 
