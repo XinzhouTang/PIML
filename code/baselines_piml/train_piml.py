@@ -40,7 +40,7 @@ from scipy.optimize import curve_fit
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 
 import joblib
 
@@ -60,6 +60,7 @@ RESULT_DIR = OUTPUT_DIR / "results"
 # Create output folders automatically if they do not exist
 for d in [OUTPUT_DIR, MODEL_DIR, PROCESSED_DIR, RESULT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
 
 
 # ==============================================================================
@@ -152,7 +153,28 @@ class RheoConfig:
     res_floor_highT: float = -0.02
     use_plateau_res_floor: bool = True
 
+# ==============================================================================
+# Metric functions
+# ==============================================================================
+def calc_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
 
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+
+    log_true = np.log10(y_true + 1e-12)
+    log_pred = np.log10(y_pred + 1e-12)
+    log_rmse = float(np.sqrt(np.mean((log_pred - log_true) ** 2)))
+
+    return {
+        "R2": r2,
+        "RMSE": rmse,
+        "MAE": mae,
+        "Log_RMSE": log_rmse,
+    }
 # ==============================================================================
 # Main hybrid model
 # ==============================================================================
@@ -581,10 +603,8 @@ class RheoHybridModel:
         y_pred_log = df_ml["Log_Eta_Theory"].values + res_pred
         y_pred = np.power(10.0, y_pred_log)
 
-        mse = mean_squared_error(df_ml["Eta"].values, y_pred)
-        r2 = r2_score(df_ml["Eta"].values, y_pred)
-        return float(mse), float(r2)
-
+        metrics = calc_eval_metrics(df_ml["Eta"].values, y_pred)
+        return metrics
     def predict(self, df_test: pd.DataFrame) -> np.ndarray:
         """Predict viscosity for new samples."""
         df = df_test.copy()
@@ -649,6 +669,7 @@ class RheoHybridModel:
         model.rheo_Tref0 = payload["rheo_Tref0"]
         model.rheo_ml = payload["rheo_ml"]
         return model
+
 
 
 # ==============================================================================
@@ -718,7 +739,7 @@ if __name__ == "__main__":
         df_rheo_test = df_rheo.iloc[te_idx].reset_index(drop=True)
 
         # Step 4: train the ML residual model
-        rheo_mse_tr, rheo_r2_tr = model.train(df_rheo_train.copy())
+        rheo_train_metrics = model.train(df_rheo_train.copy())
 
         # Training-set prediction
         rheo_pred_tr = model.predict(
@@ -734,8 +755,7 @@ if __name__ == "__main__":
         rheo_pred_te = model.predict(
             df_rheo_test[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
         )
-        rheo_mse_te = mean_squared_error(df_rheo_test["Eta"].values, rheo_pred_te)
-        rheo_r2_te = r2_score(df_rheo_test["Eta"].values, rheo_pred_te)
+        rheo_test_metrics = calc_eval_metrics(df_rheo_test["Eta"].values, rheo_pred_te)
 
         df_rheo_test_out = df_rheo_test.copy()
         df_rheo_test_out["Eta_pred"] = rheo_pred_te
@@ -744,8 +764,25 @@ if __name__ == "__main__":
         ).abs()
 
         # Print summary metrics
-        print(f">>> Training results: MSE = {rheo_mse_tr:.4e}, R2 = {rheo_r2_tr:.4f}")
-        print(f">>> Test results:     MSE = {rheo_mse_te:.4e}, R2 = {rheo_r2_te:.4f}")
+        print(
+            f">>> Training results: "
+            f"R2 = {rheo_train_metrics['R2']:.4f}, "
+            f"RMSE = {rheo_train_metrics['RMSE']:.4e}, "
+            f"MAE = {rheo_train_metrics['MAE']:.4e}, "
+            f"Log_RMSE = {rheo_train_metrics['Log_RMSE']:.4f}"
+        )
+        print(
+            f">>> Test results:     "
+            f"R2 = {rheo_test_metrics['R2']:.4f}, "
+            f"RMSE = {rheo_test_metrics['RMSE']:.4e}, "
+            f"MAE = {rheo_test_metrics['MAE']:.4e}, "
+            f"Log_RMSE = {rheo_test_metrics['Log_RMSE']:.4f}"
+        )
+        metrics_train_path = RESULT_DIR / "Rheo_Train_Metrics.csv"
+        metrics_test_path = RESULT_DIR / "Rheo_Test_Metrics.csv"
+
+        pd.DataFrame([rheo_train_metrics]).to_csv(metrics_train_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame([rheo_test_metrics]).to_csv(metrics_test_path, index=False, encoding="utf-8-sig")
 
         # Save train/test result files
         df_rheo_train_out.to_csv(train_result_path, index=False, encoding="utf-8-sig")

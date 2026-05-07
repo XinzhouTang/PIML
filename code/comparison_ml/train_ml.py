@@ -73,30 +73,29 @@ class TrainConfig:
 # ==============================================================================
 
 def calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = float(np.sqrt(mse))
-    r2 = r2_score(y_true, y_pred)
-    return {"R2": float(r2), "MSE": float(mse), "RMSE": rmse}
-
-
-def calc_mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    return float(np.mean(np.abs((y_pred - y_true) / (y_true + eps))) * 100.0)
+
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+
+    return {
+        "R2": r2,
+        "RMSE": rmse,
+        "MAE": mae,
+    }
+
 
 
 def calc_log_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     log_true = np.log10(np.asarray(y_true, dtype=float) + 1e-12)
     log_pred = np.log10(np.asarray(y_pred, dtype=float) + 1e-12)
 
-    log_r2 = r2_score(log_true, log_pred)
-    log_mae = float(np.mean(np.abs(log_pred - log_true)))
     log_rmse = float(np.sqrt(np.mean((log_pred - log_true) ** 2)))
 
     return {
-        "Log_R2": float(log_r2),
-        "Log_MAE": float(log_mae),
-        "Log_RMSE": float(log_rmse),
+        "Log_RMSE": log_rmse,
     }
 
 
@@ -106,31 +105,27 @@ def pretty_print_metrics_table(df_metrics: pd.DataFrame, title: str) -> None:
     print("\n" + title)
     print("=" * len(title))
 
-    show_cols = ["Model", "R2", "MSE", "RMSE", "MAE", "MAPE", "Log_R2", "Log_MAE", "Log_RMSE"]
+    show_cols = ["Model", "R2", "RMSE", "MAE", "Log_RMSE"]
     sub_show = sub[show_cols].copy()
 
     sub_show["R2"] = sub_show["R2"].map(lambda x: f"{x:.4f}")
-    sub_show["MSE"] = sub_show["MSE"].map(lambda x: f"{x:.4e}")
     sub_show["RMSE"] = sub_show["RMSE"].map(lambda x: f"{x:.4e}")
     sub_show["MAE"] = sub_show["MAE"].map(lambda x: f"{x:.4e}")
-    sub_show["MAPE"] = sub_show["MAPE"].map(lambda x: f"{x:.2f}%")
-    sub_show["Log_R2"] = sub_show["Log_R2"].map(lambda x: f"{x:.4f}")
-    sub_show["Log_MAE"] = sub_show["Log_MAE"].map(lambda x: f"{x:.4f}")
     sub_show["Log_RMSE"] = sub_show["Log_RMSE"].map(lambda x: f"{x:.4f}")
 
     w_model = max(14, sub_show["Model"].map(len).max())
 
     header = (
-        f"{'Model':<{w_model}}  {'R2':>8}  {'MSE':>12}  {'RMSE':>12}  "
-        f"{'MAE':>12}  {'MAPE':>10}  {'Log_R2':>8}  {'Log_MAE':>10}  {'Log_RMSE':>10}"
+        f"{'Model':<{w_model}}  {'R2':>8}  {'RMSE':>12}  "
+        f"{'MAE':>12}  {'Log_RMSE':>10}"
     )
     print(header)
     print("-" * len(header))
 
     for _, r in sub_show.iterrows():
         print(
-            f"{r['Model']:<{w_model}}  {r['R2']:>8}  {r['MSE']:>12}  {r['RMSE']:>12}  "
-            f"{r['MAE']:>12}  {r['MAPE']:>10}  {r['Log_R2']:>8}  {r['Log_MAE']:>10}  {r['Log_RMSE']:>10}"
+            f"{r['Model']:<{w_model}}  {r['R2']:>8}  "
+            f"{r['RMSE']:>12}  {r['MAE']:>12}  {r['Log_RMSE']:>10}"
         )
 
 
@@ -425,36 +420,24 @@ if __name__ == "__main__":
         pred_test = np.maximum(pred_test, 1e-12)
 
         train_base = calc_metrics(y_train, pred_train)
-        train_mae = mean_absolute_error(y_train, pred_train)
-        train_mape = calc_mape(y_train, pred_train)
         train_log = calc_log_metrics(y_train, pred_train)
 
         metrics_train_rows.append({
             "Model": model_name,
             "R2": train_base["R2"],
-            "MSE": train_base["MSE"],
             "RMSE": train_base["RMSE"],
-            "MAE": float(train_mae),
-            "MAPE": float(train_mape),
-            "Log_R2": train_log["Log_R2"],
-            "Log_MAE": train_log["Log_MAE"],
+            "MAE": train_base["MAE"],
             "Log_RMSE": train_log["Log_RMSE"],
         })
 
         test_base = calc_metrics(y_test, pred_test)
-        test_mae = mean_absolute_error(y_test, pred_test)
-        test_mape = calc_mape(y_test, pred_test)
         test_log = calc_log_metrics(y_test, pred_test)
 
         metrics_test_rows.append({
             "Model": model_name,
             "R2": test_base["R2"],
-            "MSE": test_base["MSE"],
             "RMSE": test_base["RMSE"],
-            "MAE": float(test_mae),
-            "MAPE": float(test_mape),
-            "Log_R2": test_log["Log_R2"],
-            "Log_MAE": test_log["Log_MAE"],
+            "MAE": test_base["MAE"],
             "Log_RMSE": test_log["Log_RMSE"],
         })
 
@@ -462,20 +445,17 @@ if __name__ == "__main__":
             f"  train: "
             f"R2={train_base['R2']:.4f} | "
             f"RMSE={train_base['RMSE']:.4e} | "
-            f"MSE={train_base['MSE']:.4e} | "
-            f"MAE={train_mae:.4e} | "
-            f"MAPE={train_mape:.2f}%"
+            f"MAE={train_base['MAE']:.4e} | "
+            f"Log_RMSE={train_log['Log_RMSE']:.4f}"
         )
 
         print(
             f"  test: "
             f"R2={test_base['R2']:.4f} | "
             f"RMSE={test_base['RMSE']:.4e} | "
-            f"MSE={test_base['MSE']:.4e} | "
-            f"MAE={test_mae:.4e} | "
-            f"MAPE={test_mape:.2f}%"
+            f"MAE={test_base['MAE']:.4e} | "
+            f"Log_RMSE={test_log['Log_RMSE']:.4f}"
         )
-
         save_payload = {
             "best_model": best_model,
             "feature_cols": feat_cols,
