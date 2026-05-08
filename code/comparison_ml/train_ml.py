@@ -6,9 +6,9 @@ Functions:
 1) Read the raw training Excel file
 2) Preprocess:
    - keep only rows with Eta > eta_min_keep
-   - aggregate by median over (T, Salt, Cs, fs, Cp, Gamma)
+   - aggregate by median over (T, Salt, Cs, fs, C, Gamma)
 3) Perform GroupShuffleSplit on the full processed training dataset
-   using formulation groups (Salt, Cs, fs, Cp)
+   using formulation groups (Salt, Cs, fs, C)
 4) Train models only on the training split
 5) If hyperparameter tuning is enabled, perform GroupKFold inside the training split
 6) Evaluate models on train / test
@@ -146,11 +146,11 @@ class DataProcessor:
         self._log("  Preprocessing data...")
 
         df = df_raw.copy()
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
         df = df[df["Gamma"] > 0].copy()
         df = df[df["Eta"] > float(self.eta_min_keep)].copy()
 
-        group_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+        group_cols = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
         df_proc = (
             df.groupby(group_cols, as_index=False, sort=False)
               .agg({"Eta": "median"})
@@ -198,8 +198,8 @@ def build_formula_groups(df: pd.DataFrame) -> pd.Series:
     s_salt = df["Salt"].astype(str)
     s_Cs = df["Cs"].map(lambda x: f"{float(x):.8g}")
     s_fs = df["fs"].map(lambda x: f"{float(x):.8g}")
-    s_Cp = df["Cp"].map(lambda x: f"{float(x):.8g}")
-    return s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_Cp
+    s_C = df["C"].map(lambda x: f"{float(x):.8g}")
+    return s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_C
 
 
 def build_curve_groups(df: pd.DataFrame) -> pd.Series:
@@ -225,7 +225,7 @@ if __name__ == "__main__":
 
     print("  Reading Excel data...")
     df_raw = pd.read_excel(cfg.xlsx_path, header=cfg.xlsx_header)
-    df_raw.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]
+    df_raw.columns = ["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]
 
     processor = DataProcessor(eta_min_keep=cfg.eta_min_keep, verbose=True)
     processed_path = os.path.join(cfg.base_out_dir, "Processed.csv")
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     print(f"  Training set saved to: {train_csv}")
     print(f"  Test set saved to: {test_csv}")
 
-    feat_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+    feat_cols = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
     y_col = "Eta"
 
     fb = FeatureBuilder()
@@ -462,9 +462,9 @@ if __name__ == "__main__":
             "target_col": y_col,
             "use_log_target": cfg.use_log_target,
             "eta_min_keep": cfg.eta_min_keep,
-            "group_definition_outer": "(Salt, Cs, fs, Cp)",
-            "group_definition_inner": "(Salt, Cs, fs, Cp)",
-            "curve_definition": "(Salt, Cs, fs, Cp, T)",
+            "group_definition_outer": "(Salt, Cs, fs, C)",
+            "group_definition_inner": "(Salt, Cs, fs, C)",
+            "curve_definition": "(Salt, Cs, fs, C, T)",
             "random_state": cfg.random_state,
             "model_name": model_name,
         }

@@ -254,7 +254,7 @@ class RheoHybridModel:
         """
         self._log(">>> Fitting rheology physics parameters (CY + E) ...")
 
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
         self._fit_carreau_yasuda_params(df)
@@ -271,7 +271,7 @@ class RheoHybridModel:
         """Fit Carreau–Yasuda parameters for each formulation."""
         self.rheo_cy_params = {}
 
-        for (salt, Cs, fs, Cp), g in df.groupby(["Salt", "Cs", "fs", "Cp"]):
+        for (salt, Cs, fs, C), g in df.groupby(["Salt", "Cs", "fs", "C"]):
             temps = np.array(sorted(g["T"].unique()))
             if len(temps) == 0:
                 continue
@@ -288,7 +288,7 @@ class RheoHybridModel:
                 else:
                     eta0_ref, eta_inf = 1.0, 0.0
 
-                self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(Cp))] = {
+                self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(C))] = {
                     "Tref_K": Tref_used_K,
                     "eta0_ref": eta0_ref,
                     "eta_inf": eta_inf,
@@ -323,7 +323,7 @@ class RheoHybridModel:
             except Exception:
                 eta0_ref, eta_inf, lam_ref, n, a = [float(v) for v in p0]
 
-            self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(Cp))] = {
+            self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(C))] = {
                 "Tref_K": Tref_used_K,
                 "eta0_ref": eta0_ref,
                 "eta_inf": eta_inf,
@@ -339,7 +339,7 @@ class RheoHybridModel:
 
         Es: List[float] = []
 
-        for (salt, Cs, fs, Cp), g in df.groupby(["Salt", "Cs", "fs", "Cp"]):
+        for (salt, Cs, fs, C), g in df.groupby(["Salt", "Cs", "fs", "C"]):
             g = g.copy()
             g["Gamma"] = g["Gamma"].astype(float)
             g["Eta"] = g["Eta"].astype(float)
@@ -425,18 +425,18 @@ class RheoHybridModel:
         eta_out = np.empty(len(df), dtype=float)
         df_local = df.reset_index(drop=True)
 
-        for (salt, Cs, fs, Cp), idx in df_local.groupby(["Salt_raw", "Cs", "fs", "Cp"]).groups.items():
+        for (salt, Cs, fs, C), idx in df_local.groupby(["Salt_raw", "Cs", "fs", "C"]).groups.items():
             rows = np.array(list(idx), dtype=int)
             sub = df_local.loc[rows]
 
-            key = (str(salt), float(Cs), float(fs), float(Cp))
+            key = (str(salt), float(Cs), float(fs), float(C))
             p = self.rheo_cy_params.get(key, None)
 
             if p is None:
                 if self.rheo_cfg.show_missing_formula_warning and self.verbose:
                     print(
                         "[WARN] Missing CY formulation parameters: "
-                        f"Salt={salt}, Cs={Cs}, fs={fs}, Cp={Cp}"
+                        f"Salt={salt}, Cs={Cs}, fs={fs}, C={C}"
                     )
 
                 eta0_ref, eta_inf, lam_ref, n, a = 1.0, 0.0, 1.0, 0.5, 2.0
@@ -500,7 +500,7 @@ class RheoHybridModel:
 
         mask_bottomk = np.zeros(n, dtype=bool)
 
-        group_cols = ["Salt_raw", "Cs", "fs", "Cp", "T"]
+        group_cols = ["Salt_raw", "Cs", "fs", "C", "T"]
         for _, idx in df_feat.groupby(group_cols).groups.items():
             rows = np.array(list(idx), dtype=int)
             if len(rows) == 0:
@@ -525,11 +525,11 @@ class RheoHybridModel:
         self._log(">>> Preprocessing rheology data ...")
 
         df = df_raw.copy()
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
         df = df[df["Gamma"] > 0].copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
-        group_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+        group_cols = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
         df_proc = (
             df.groupby(group_cols, as_index=False, sort=False)
               .agg({"Eta": "median"})
@@ -543,7 +543,7 @@ class RheoHybridModel:
         """Train the random-forest residual model on the training set."""
         self._log(">>> [Rheo] Training ...")
 
-        df_train = df_train.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
+        df_train = df_train.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
         df_train = df_train[df_train["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
         df_feat = df_train.copy()
@@ -552,7 +552,7 @@ class RheoHybridModel:
         df_ml = self._preprocess_cat(df_feat, is_training=True)
 
         eta_theory = self._theory_eta_batch(
-            df_feat[["Salt_raw", "Cs", "fs", "Cp", "T", "Gamma"]]
+            df_feat[["Salt_raw", "Cs", "fs", "C", "T", "Gamma"]]
         )
         df_ml["Eta_Theory"] = eta_theory
         df_ml["Log_Eta_Theory"] = np.log10(df_ml["Eta_Theory"].values + 1e-12)
@@ -585,7 +585,7 @@ class RheoHybridModel:
         )
 
         base_features = [
-            "Salt", "Cs", "fs", "Cp",
+            "Salt", "Cs", "fs", "C",
             "Gamma", "aT_global", "Gamma_Reduced", "Log_Eta_Theory"
         ]
         if self.rheo_cfg.include_raw_T_feature:
@@ -608,13 +608,13 @@ class RheoHybridModel:
     def predict(self, df_test: pd.DataFrame) -> np.ndarray:
         """Predict viscosity for new samples."""
         df = df_test.copy()
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma"]).copy()
 
         df["Salt_raw"] = df["Salt"].astype(str)
         df_ml = self._preprocess_cat(df, is_training=False)
 
         eta_theory = self._theory_eta_batch(
-            df[["Salt_raw", "Cs", "fs", "Cp", "T", "Gamma"]]
+            df[["Salt_raw", "Cs", "fs", "C", "T", "Gamma"]]
         )
         df_ml["Eta_Theory"] = eta_theory
         df_ml["Log_Eta_Theory"] = np.log10(df_ml["Eta_Theory"].values + 1e-12)
@@ -631,7 +631,7 @@ class RheoHybridModel:
         )
 
         base_features = [
-            "Salt", "Cs", "fs", "Cp",
+            "Salt", "Cs", "fs", "C",
             "Gamma", "aT_global", "Gamma_Reduced", "Log_Eta_Theory"
         ]
         if self.rheo_cfg.include_raw_T_feature:
@@ -714,9 +714,9 @@ if __name__ == "__main__":
         print(">>> Reading Excel data ...")
         print(f">>> Input file: {rheo_xlsx_path}")
 
-        # Training file has 7 columns: T, Salt, Cs, fs, Cp, Gamma, Eta
+        # Training file has 7 columns: T, Salt, Cs, fs, C, Gamma, Eta
         df_rheo_raw = pd.read_excel(rheo_xlsx_path, header=1)
-        df_rheo_raw.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]
+        df_rheo_raw.columns = ["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]
 
         # Step 1: preprocess and save processed data
         df_rheo = model.preprocess_data(df_rheo_raw, save_path=processed_path)
@@ -729,8 +729,8 @@ if __name__ == "__main__":
         s_salt = df_rheo["Salt"].astype(str)
         s_Cs = df_rheo["Cs"].map(lambda x: f"{float(x):.8g}")
         s_fs = df_rheo["fs"].map(lambda x: f"{float(x):.8g}")
-        s_Cp = df_rheo["Cp"].map(lambda x: f"{float(x):.8g}")
-        rheo_groups = s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_Cp
+        s_C = df_rheo["C"].map(lambda x: f"{float(x):.8g}")
+        rheo_groups = s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_C
 
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=0)
         tr_idx, te_idx = next(gss.split(df_rheo, groups=rheo_groups))
@@ -743,7 +743,7 @@ if __name__ == "__main__":
 
         # Training-set prediction
         rheo_pred_tr = model.predict(
-            df_rheo_train[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
+            df_rheo_train[["T", "Salt", "Cs", "fs", "C", "Gamma"]].copy()
         )
         df_rheo_train_out = df_rheo_train.copy()
         df_rheo_train_out["Eta_pred"] = rheo_pred_tr
@@ -753,7 +753,7 @@ if __name__ == "__main__":
 
         # Test-set prediction
         rheo_pred_te = model.predict(
-            df_rheo_test[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
+            df_rheo_test[["T", "Salt", "Cs", "fs", "C", "Gamma"]].copy()
         )
         rheo_test_metrics = calc_eval_metrics(df_rheo_test["Eta"].values, rheo_pred_te)
 

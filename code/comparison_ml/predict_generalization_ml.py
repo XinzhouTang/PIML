@@ -74,9 +74,9 @@ if __name__ == "__main__":
 
     print("Loading generalization dataset...")
     df_gen = pd.read_excel(generalization_xlsx, header=1)
-    df_gen.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+    df_gen.columns = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
 
-    df_gen = df_gen.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma"]).copy()
+    df_gen = df_gen.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma"]).copy()
     df_gen = df_gen[df_gen["Gamma"] > 0].copy()
 
     print(f"Number of generalization samples: {len(df_gen)}")
@@ -85,7 +85,7 @@ if __name__ == "__main__":
 
     salt_encoder = joblib.load(encoder_path)
 
-    feat_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+    feat_cols = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
     df_gen_all = df_gen.copy()
 
     X_gen_df = transform_with_encoder(df_gen[feat_cols].copy(), salt_encoder)

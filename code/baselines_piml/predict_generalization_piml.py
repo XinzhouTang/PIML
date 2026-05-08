@@ -59,12 +59,12 @@ if __name__ == "__main__":
     print(">>> Reading generalization dataset ...")
     print(f">>> Input file: {val_path}")
 
-    # Generalization file has 6 columns: T, Salt, Cs, fs, Cp, Gamma
+    # Generalization file has 6 columns: T, Salt, Cs, fs, C, Gamma
     df_val = pd.read_excel(val_path, header=1)
-    df_val.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
+    df_val.columns = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
 
     # Basic cleaning before prediction
-    df_val = df_val.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma"]).copy()
+    df_val = df_val.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma"]).copy()
     df_val = df_val[df_val["Gamma"] > 0].copy()
 
     print(f">>> Number of generalization samples: {len(df_val)}")
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 
     # Predict viscosity using the trained model
     eta_pred = model.predict(
-        df_val[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
+        df_val[["T", "Salt", "Cs", "fs", "C", "Gamma"]].copy()
     )
 
     # Save row-wise prediction results
