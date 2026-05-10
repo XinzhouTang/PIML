@@ -119,7 +119,7 @@ class RheoConfig:
     p_eta0_highT: float = 100.0
 
     # Default activation energy if fitting from data fails
-    default_E: float = 5.0e4  # J/mol
+    default_E: float = 1.05e3 # J/mol
 
     # Whether to fit a global activation energy from data
     fit_E_from_data: bool = True
