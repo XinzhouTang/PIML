@@ -1,30 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Physics-Informed Machine Learning (PIML) for Rheology Modeling
-----------------------------------------------------------------
-Main features:
-1) Introduce temperature through the Arrhenius shift factor aT
-   (definition: at lower temperature, aT > 1)
-2) Use the Carreau–Yasuda (CY) model as the physics-based baseline:
-   eta_theory(gamma, T)
-3) Train a random forest on log-space residuals:
-   residual = log10(eta) - log10(eta_theory)
-4) Support temperature-imbalance sample weighting with capped weights
-5) Preserve segmented high-temperature p_eta0 for extrapolation
-6) Use the full training dataset for preprocessing, physics fitting, and train/test split
-7) External generalization prediction is handled separately by predict_generalization_piml.py
+Physics-informed machine learning model for rheological viscosity prediction.
+
+The model combines a Carreau-Yasuda viscosity baseline with an Arrhenius
+temperature shift factor. A random forest model is trained on log-space
+residuals between measured viscosity and the physics-based baseline.
 
 Workflow:
-- Read raw rheology training data from Excel
-- Preprocess and aggregate repeated measurements
-- Fit physics parameters on the processed training data
-- Split processed data into training and test sets
-- Train the random-forest residual model
-- Save train/test predictions and the trained model
+1. Read the rheology training dataset.
+2. Preprocess repeated measurements.
+3. Fit formulation-specific physics parameters.
+4. Split the processed dataset by formulation group.
+5. Train the residual-learning model.
+6. Save train/test predictions, evaluation metrics, and the trained model.
 
-Important:
-This training script does NOT run external generalization prediction.
-To predict the generalization samples, run predict_generalization_piml.py separately.
+External generalization prediction is performed by predict_generalization_piml.py.
 """
 
 import warnings
@@ -51,13 +41,13 @@ import joblib
 CODE_DIR = Path(__file__).resolve().parent
 REPO_DIR = CODE_DIR.parent.parent
 DATA_DIR = REPO_DIR / "data"
-# All generated files are stored under code/baselines_piml/outputs/
+# Output files are written under code/baselines_piml1/outputs/
 OUTPUT_DIR = CODE_DIR / "outputs"
 MODEL_DIR = OUTPUT_DIR / "models"
 PROCESSED_DIR = OUTPUT_DIR / "processed"
 RESULT_DIR = OUTPUT_DIR / "results"
 
-# Create output folders automatically if they do not exist
+# Create output directories if required
 for d in [OUTPUT_DIR, MODEL_DIR, PROCESSED_DIR, RESULT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -68,17 +58,15 @@ for d in [OUTPUT_DIR, MODEL_DIR, PROCESSED_DIR, RESULT_DIR]:
 # ==============================================================================
 
 class PhysicsFormulas:
-    """Collection of rheology-related physics formulas."""
+    """Rheology model equations."""
     R = 8.314  # Gas constant, J/mol/K
 
     @staticmethod
     def arrhenius_log10_aT(T_K: np.ndarray, E: float, Tref_K: float) -> np.ndarray:
         """
-        Arrhenius shift factor in log10 form.
-        Definition:
-            at lower temperature, aT > 1
-        Formula:
-            log10(aT) = +(E / (R * ln(10))) * (1/T - 1/Tref)
+        Arrhenius temperature shift factor in log10 form.
+
+        log10(aT) = E / (R ln(10)) * (1/T - 1/Tref)
         """
         T_K = np.asarray(T_K, dtype=float)
         return (E / (PhysicsFormulas.R * np.log(10.0))) * ((1.0 / T_K) - (1.0 / Tref_K))
@@ -91,10 +79,10 @@ class PhysicsFormulas:
                            n: float,
                            a: float) -> np.ndarray:
         """
-        Carreau–Yasuda viscosity model.
-        Formula:
-            eta(gamma) = eta_inf + (eta0 - eta_inf) *
-                         (1 + (lam * gamma)^a)^((n - 1) / a)
+        Carreau-Yasuda viscosity model.
+
+        eta(gamma) = eta_inf + (eta0 - eta_inf)
+                     * (1 + (lambda * gamma)^a)^((n - 1) / a)
         """
         g = np.asarray(gamma, dtype=float) + 1e-12
         eta0 = np.asarray(eta0, dtype=float)
@@ -110,48 +98,52 @@ class PhysicsFormulas:
 
 @dataclass
 class RheoConfig:
-    # Global reference temperature in Celsius
+    # Reference temperature in Celsius
     Tref_c: float = 25.0
 
-    # Segmented exponent for eta0(T) at high temperature
+    # Temperature-dependent eta0 exponent
     p_eta0_low: float = 1.0
     p_eta0_high: float = 0.75
     p_eta0_highT: float = 100.0
 
-    # Default activation energy if fitting from data fails
-    default_E: float = 1.05e3 # J/mol
+    # Default activation energy
+    default_E: float = 1.05e3  # J/mol
 
-    # Whether to fit a global activation energy from data
+    # Fit global activation energy from data
     fit_E_from_data: bool = True
 
-    # Allowed range for fitted activation energy
+    # Bounds for fitted activation energy
     E_min: float = 8.0e3
     E_max: float = 2.0e5
 
-    # Whether to apply sample weighting to reduce temperature imbalance
+    # Apply sample weighting for temperature imbalance
     use_temp_weights: bool = True
 
-    # Weighting mode
+    # Sample weighting mode
     weight_mode: str = "inv_sqrt"
     max_weight_ratio: float = 80.0
 
-    # Whether to include raw T as an ML feature
+    # Include raw temperature as an ML feature
     include_raw_T_feature: bool = False
 
-    # Remove very small viscosity values before fitting/training
+    # Minimum viscosity retained for fitting and training
     eta_min_keep: float = 0.5
 
-    # Show warning if a formulation is missing fitted CY parameters
+    # Report formulations without fitted CY parameters
     show_missing_formula_warning: bool = True
 
-    # Plateau-region identification parameters
+    # Low-shear plateau identification parameters
     plateau_gamma_abs: float = 1e-2
     plateau_bottomk: int = 5
 
-    # Apply a lower bound to residuals in the high-temperature plateau region
+    # Residual lower bound for high-temperature low-shear samples
     res_floor_apply_Tmin: float = 100.0
     res_floor_highT: float = -0.02
     use_plateau_res_floor: bool = True
+
+    # Residual interpolation setting for prediction
+    use_residual_spike_repair: bool = True
+    residual_spike_jump_threshold: float = 0.30
 
 # ==============================================================================
 # Metric functions
@@ -159,6 +151,18 @@ class RheoConfig:
 def calc_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
+
+    mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true > 0) & (y_pred > 0)
+    if mask.sum() == 0:
+        return {
+            "R2": np.nan,
+            "RMSE": np.nan,
+            "MAE": np.nan,
+            "Log_RMSE": np.nan,
+        }
+
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
 
     mse = mean_squared_error(y_true, y_pred)
     rmse = float(np.sqrt(mse))
@@ -181,9 +185,11 @@ def calc_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float
 
 class RheoHybridModel:
     """
-    Hybrid rheology model:
-    - Physics part: Carreau–Yasuda + Arrhenius temperature shift
-    - ML part: random forest trained on residuals in log space
+    Hybrid rheology model.
+
+    The physics component provides a Carreau-Yasuda baseline with an
+    Arrhenius temperature shift factor. The machine-learning component
+    models log-space residuals using a random forest regressor.
     """
 
     def __init__(self,
@@ -192,17 +198,20 @@ class RheoHybridModel:
         self.rheo_cfg = rheo_cfg
         self.verbose = verbose
 
-        # Encoder for categorical variable Salt
+        # Categorical encoder for Salt
         self.encoders: Dict[str, LabelEncoder] = {}
 
-        # Fitted CY parameters for each formulation
+        # Fitted CY parameters by formulation
         self.rheo_cy_params: Dict[Tuple[str, float, float, float], Dict[str, float]] = {}
 
-        # Global Arrhenius parameters
+        # Formulations without available CY parameters
+        self.rheo_invalid_formulations: set[Tuple[str, float, float, float]] = set()
+
+        # Arrhenius parameters
         self.rheo_E: float = rheo_cfg.default_E
         self.rheo_Tref0: float = rheo_cfg.Tref_c + 273.15  # Kelvin
 
-        # Random-forest model for residual learning
+        # Random forest residual model
         self.rheo_ml = RandomForestRegressor(
             n_estimators=500,
             max_depth=None,
@@ -210,13 +219,17 @@ class RheoHybridModel:
             random_state=0
         )
 
+        # Residual clipping limits estimated during training
+        self.rheo_res_clip_low: Optional[float] = None
+        self.rheo_res_clip_high: Optional[float] = None
+
     def _log(self, msg: str) -> None:
-        """Print log message when verbose mode is on."""
+        """Print a message when verbose mode is enabled."""
         if self.verbose:
             print(msg)
 
     def _preprocess_cat(self, df: pd.DataFrame, is_training: bool) -> pd.DataFrame:
-        """Encode the categorical variable Salt."""
+        """Encode the categorical Salt variable."""
         df_proc = df.copy()
 
         if is_training:
@@ -241,20 +254,21 @@ class RheoHybridModel:
         return df_proc
 
     def _get_aT(self, T_c: np.ndarray, E: float, Tref_K: float) -> np.ndarray:
-        """Convert Celsius to Kelvin and compute Arrhenius shift factor."""
+        """Convert Celsius temperatures and compute Arrhenius shift factors."""
         T_K = np.asarray(T_c, dtype=float) + 273.15
         log10_aT = PhysicsFormulas.arrhenius_log10_aT(T_K, E, Tref_K)
         return np.power(10.0, log10_aT)
 
     def fit_physics(self, df: pd.DataFrame) -> None:
         """
-        Fit the physics part of the hybrid model:
-        1) Carreau–Yasuda parameters for each formulation
-        2) A global activation energy E (optional)
+        Fit the physics component of the hybrid model.
+
+        This includes formulation-specific Carreau-Yasuda parameters and,
+        when enabled, a global activation energy.
         """
         self._log(">>> Fitting rheology physics parameters (CY + E) ...")
 
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
         self._fit_carreau_yasuda_params(df)
@@ -268,34 +282,27 @@ class RheoHybridModel:
                 self._log(f">>> Activation energy fitting failed. Using default E = {self.rheo_E:.4e} J/mol")
 
     def _fit_carreau_yasuda_params(self, df: pd.DataFrame) -> None:
-        """Fit Carreau–Yasuda parameters for each formulation."""
+        """Fit formulation-specific Carreau-Yasuda parameters."""
         self.rheo_cy_params = {}
+        self.rheo_invalid_formulations = set()
 
-        for (salt, Cs, fs, C), g in df.groupby(["Salt", "Cs", "fs", "C"]):
+        for (salt, Cs, fs, Cp), g in df.groupby(["Salt", "Cs", "fs", "Cp"]):
             temps = np.array(sorted(g["T"].unique()))
             if len(temps) == 0:
                 continue
 
+            key = (str(salt), float(Cs), float(fs), float(Cp))
             Tref_used = 25.0 if 25.0 in temps else float(temps[np.argmin(np.abs(temps - 25.0))])
             Tref_used_K = Tref_used + 273.15
             gref = g[g["T"] == Tref_used].copy()
 
             if len(gref) < 6:
-                if len(gref) > 0:
-                    y = gref["Eta"].values.astype(float)
-                    eta0_ref = float(np.max(y))
-                    eta_inf = float(max(np.min(y) * 0.1, 0.0))
-                else:
-                    eta0_ref, eta_inf = 1.0, 0.0
-
-                self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(C))] = {
-                    "Tref_K": Tref_used_K,
-                    "eta0_ref": eta0_ref,
-                    "eta_inf": eta_inf,
-                    "lam_ref": 1.0,
-                    "n": 0.5,
-                    "a": 2.0,
-                }
+                self.rheo_invalid_formulations.add(key)
+                if self.rheo_cfg.show_missing_formula_warning and self.verbose:
+                    print(
+                        "[WARN] CY parameter fitting skipped: insufficient reference-temperature samples. "
+                        f"Salt={salt}, Cs={Cs}, fs={fs}, Cp={Cp}"
+                    )
                 continue
 
             x = gref["Gamma"].values.astype(float)
@@ -321,9 +328,15 @@ class RheoHybridModel:
                 )
                 eta0_ref, eta_inf, lam_ref, n, a = [float(v) for v in popt]
             except Exception:
-                eta0_ref, eta_inf, lam_ref, n, a = [float(v) for v in p0]
+                self.rheo_invalid_formulations.add(key)
+                if self.rheo_cfg.show_missing_formula_warning and self.verbose:
+                    print(
+                        "[WARN] CY parameter fitting skipped: nonlinear fitting did not converge. "
+                        f"Salt={salt}, Cs={Cs}, fs={fs}, Cp={Cp}"
+                    )
+                continue
 
-            self.rheo_cy_params[(str(salt), float(Cs), float(fs), float(C))] = {
+            self.rheo_cy_params[key] = {
                 "Tref_K": Tref_used_K,
                 "eta0_ref": eta0_ref,
                 "eta_inf": eta_inf,
@@ -333,13 +346,13 @@ class RheoHybridModel:
             }
 
     def _fit_E_from_data(self, df: pd.DataFrame) -> Optional[float]:
-        """Estimate a global Arrhenius activation energy E from data."""
+        """Estimate the global Arrhenius activation energy from the training data."""
         Tref_target = self.rheo_cfg.Tref_c
         loga_grid = np.linspace(-3.0, 3.0, 241)
 
         Es: List[float] = []
 
-        for (salt, Cs, fs, C), g in df.groupby(["Salt", "Cs", "fs", "C"]):
+        for (salt, Cs, fs, Cp), g in df.groupby(["Salt", "Cs", "fs", "Cp"]):
             g = g.copy()
             g["Gamma"] = g["Gamma"].astype(float)
             g["Eta"] = g["Eta"].astype(float)
@@ -421,33 +434,31 @@ class RheoHybridModel:
         return E_fit
 
     def _theory_eta_batch(self, df: pd.DataFrame) -> np.ndarray:
-        """Compute the physics-based baseline viscosity for a batch of samples."""
-        eta_out = np.empty(len(df), dtype=float)
+        """Compute physics-based baseline viscosity for a batch of samples."""
+        eta_out = np.full(len(df), np.nan, dtype=float)
         df_local = df.reset_index(drop=True)
 
-        for (salt, Cs, fs, C), idx in df_local.groupby(["Salt_raw", "Cs", "fs", "C"]).groups.items():
+        for (salt, Cs, fs, Cp), idx in df_local.groupby(["Salt_raw", "Cs", "fs", "Cp"]).groups.items():
             rows = np.array(list(idx), dtype=int)
             sub = df_local.loc[rows]
 
-            key = (str(salt), float(Cs), float(fs), float(C))
+            key = (str(salt), float(Cs), float(fs), float(Cp))
             p = self.rheo_cy_params.get(key, None)
 
-            if p is None:
+            if (key in self.rheo_invalid_formulations) or (p is None):
                 if self.rheo_cfg.show_missing_formula_warning and self.verbose:
                     print(
-                        "[WARN] Missing CY formulation parameters: "
-                        f"Salt={salt}, Cs={Cs}, fs={fs}, C={C}"
+                        "[WARN] CY parameters unavailable; Eta_Theory assigned NaN. "
+                        f"Salt={salt}, Cs={Cs}, fs={fs}, Cp={Cp}"
                     )
+                continue
 
-                eta0_ref, eta_inf, lam_ref, n, a = 1.0, 0.0, 1.0, 0.5, 2.0
-                Tref_K = self.rheo_Tref0
-            else:
-                eta0_ref = p["eta0_ref"]
-                eta_inf = p["eta_inf"]
-                lam_ref = p["lam_ref"]
-                n = p["n"]
-                a = p["a"]
-                Tref_K = p["Tref_K"]
+            eta0_ref = p["eta0_ref"]
+            eta_inf = p["eta_inf"]
+            lam_ref = p["lam_ref"]
+            n = p["n"]
+            a = p["a"]
+            Tref_K = p["Tref_K"]
 
             T_arr = sub["T"].values.astype(float)
             g_arr = sub["Gamma"].values.astype(float)
@@ -466,7 +477,7 @@ class RheoHybridModel:
         return eta_out
 
     def _compute_sample_weight(self, df_feat: pd.DataFrame) -> Optional[np.ndarray]:
-        """Compute sample weights to reduce temperature imbalance."""
+        """Compute sample weights for temperature imbalance."""
         if (not self.rheo_cfg.use_temp_weights) or (self.rheo_cfg.weight_mode == "none"):
             return None
 
@@ -490,7 +501,7 @@ class RheoHybridModel:
         return w
 
     def _make_plateau_mask(self, df_feat: pd.DataFrame) -> np.ndarray:
-        """Identify plateau-region points."""
+        """Identify low-shear plateau-region samples."""
         n = len(df_feat)
         if n == 0:
             return np.zeros(0, dtype=bool)
@@ -500,7 +511,7 @@ class RheoHybridModel:
 
         mask_bottomk = np.zeros(n, dtype=bool)
 
-        group_cols = ["Salt_raw", "Cs", "fs", "C", "T"]
+        group_cols = ["Salt_raw", "Cs", "fs", "Cp", "T"]
         for _, idx in df_feat.groupby(group_cols).groups.items():
             rows = np.array(list(idx), dtype=int)
             if len(rows) == 0:
@@ -517,19 +528,19 @@ class RheoHybridModel:
 
     def preprocess_data(self, df_raw: pd.DataFrame, save_path: Path) -> pd.DataFrame:
         """
-        Preprocess raw rheology data:
-        - remove rows with very small viscosity
-        - aggregate repeated measurements by median Eta
-        - save the processed dataset
+        Preprocess the rheology dataset.
+
+        The procedure removes invalid records, aggregates repeated
+        measurements by median viscosity, and saves the processed dataset.
         """
         self._log(">>> Preprocessing rheology data ...")
 
         df = df_raw.copy()
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
         df = df[df["Gamma"] > 0].copy()
         df = df[df["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
-        group_cols = ["T", "Salt", "Cs", "fs", "C", "Gamma"]
+        group_cols = ["T", "Salt", "Cs", "fs", "Cp", "Gamma"]
         df_proc = (
             df.groupby(group_cols, as_index=False, sort=False)
               .agg({"Eta": "median"})
@@ -539,21 +550,34 @@ class RheoHybridModel:
         self._log(f"    Preprocessed rheology data saved to: {save_path}")
         return df_proc
 
-    def train(self, df_train: pd.DataFrame) -> Dict[str, float]:
-        """Train the random-forest residual model on the training set."""
+    def train(self, df_train: pd.DataFrame) -> Tuple[float, float]:
+        """Train the random forest residual model."""
         self._log(">>> [Rheo] Training ...")
 
-        df_train = df_train.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]).copy()
+        df_train = df_train.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]).copy()
         df_train = df_train[df_train["Eta"] > float(self.rheo_cfg.eta_min_keep)].copy()
 
         df_feat = df_train.copy()
         df_feat["Salt_raw"] = df_feat["Salt"].astype(str)
 
-        df_ml = self._preprocess_cat(df_feat, is_training=True)
-
         eta_theory = self._theory_eta_batch(
-            df_feat[["Salt_raw", "Cs", "fs", "C", "T", "Gamma"]]
+            df_feat[["Salt_raw", "Cs", "fs", "Cp", "T", "Gamma"]]
         )
+        valid_mask = np.isfinite(eta_theory) & (eta_theory > 0)
+
+        if not np.any(valid_mask):
+            raise RuntimeError("No valid physics baseline samples are available for ML training.")
+
+        dropped_count = int((~valid_mask).sum())
+        if dropped_count > 0:
+            self._log(
+                f">>> [Rheo] Excluded {dropped_count} samples with unavailable physics baselines before residual-model training."
+            )
+
+        df_feat = df_feat.loc[valid_mask].reset_index(drop=True)
+        eta_theory = eta_theory[valid_mask]
+
+        df_ml = self._preprocess_cat(df_feat, is_training=True)
         df_ml["Eta_Theory"] = eta_theory
         df_ml["Log_Eta_Theory"] = np.log10(df_ml["Eta_Theory"].values + 1e-12)
 
@@ -572,6 +596,7 @@ class RheoHybridModel:
                     float(self.rheo_cfg.res_floor_highT)
                 )
 
+
         aT_global = self._get_aT(
             df_ml["T"].values.astype(float),
             self.rheo_E,
@@ -585,7 +610,7 @@ class RheoHybridModel:
         )
 
         base_features = [
-            "Salt", "Cs", "fs", "C",
+            "Salt", "Cs", "fs", "Cp",
             "Gamma", "aT_global", "Gamma_Reduced", "Log_Eta_Theory"
         ]
         if self.rheo_cfg.include_raw_T_feature:
@@ -605,19 +630,98 @@ class RheoHybridModel:
 
         metrics = calc_eval_metrics(df_ml["Eta"].values, y_pred)
         return metrics
+
+    def _repair_isolated_residual_spikes_for_prediction(
+        self,
+        df_info: pd.DataFrame,
+        res_pred: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Interpolate isolated residual spikes during prediction.
+
+        The procedure is applied to the residual correction only and does not
+        modify the physics-based baseline viscosity.
+        """
+        jump_threshold = float(
+            getattr(self.rheo_cfg, "residual_spike_jump_threshold", 0.30)
+        )
+
+        df = df_info.copy().reset_index(drop=True)
+        df["_row_id"] = np.arange(len(df))
+        df["res_pred"] = np.asarray(res_pred, dtype=float)
+        df["res_pred_fixed"] = df["res_pred"].values
+
+        group_cols = ["T", "Salt_raw", "Cs", "fs", "Cp"]
+
+        for _, idx in df.groupby(group_cols, sort=False).groups.items():
+            idx = list(idx)
+
+            if len(idx) < 3:
+                continue
+
+            sub = df.loc[idx].copy().sort_values("Gamma")
+            rows = sub.index.to_numpy()
+
+            gamma = sub["Gamma"].astype(float).values
+            res = sub["res_pred"].astype(float).values
+            res_fixed = res.copy()
+
+            if np.any(gamma <= 0):
+                continue
+
+            log_gamma = np.log10(gamma)
+
+            for i in range(1, len(res) - 1):
+                left = res[i - 1]
+                mid = res[i]
+                right = res[i + 1]
+
+                diff_left = mid - left
+                diff_right = mid - right
+
+                is_isolated_spike = (
+                    abs(diff_left) > jump_threshold and
+                    abs(diff_right) > jump_threshold and
+                    diff_left * diff_right > 0
+                )
+
+                if is_isolated_spike:
+                    denom = log_gamma[i + 1] - log_gamma[i - 1]
+                    if abs(denom) > 1e-12:
+                        w = (log_gamma[i] - log_gamma[i - 1]) / denom
+                        res_fixed[i] = left + w * (right - left)
+                    else:
+                        res_fixed[i] = 0.5 * (left + right)
+
+            df.loc[rows, "res_pred_fixed"] = res_fixed
+
+        df = df.sort_values("_row_id")
+        return df["res_pred_fixed"].to_numpy(dtype=float)
+
     def predict(self, df_test: pd.DataFrame) -> np.ndarray:
         """Predict viscosity for new samples."""
         df = df_test.copy()
-        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "C", "Gamma"]).copy()
+        df = df.dropna(subset=["T", "Salt", "Cs", "fs", "Cp", "Gamma"]).copy()
 
         df["Salt_raw"] = df["Salt"].astype(str)
         df_ml = self._preprocess_cat(df, is_training=False)
 
         eta_theory = self._theory_eta_batch(
-            df[["Salt_raw", "Cs", "fs", "C", "T", "Gamma"]]
+            df[["Salt_raw", "Cs", "fs", "Cp", "T", "Gamma"]]
         )
+
+        eta_pred = np.full(len(df_ml), np.nan, dtype=float)
+        valid_mask = np.isfinite(eta_theory) & (eta_theory > 0)
+
+        if not np.any(valid_mask):
+            return eta_pred
+
         df_ml["Eta_Theory"] = eta_theory
-        df_ml["Log_Eta_Theory"] = np.log10(df_ml["Eta_Theory"].values + 1e-12)
+        df_ml["Log_Eta_Theory"] = np.where(
+            valid_mask,
+            np.log10(df_ml["Eta_Theory"].values + 1e-12),
+            np.nan
+        )
 
         aT_global = self._get_aT(
             df_ml["T"].values.astype(float),
@@ -631,18 +735,26 @@ class RheoHybridModel:
         )
 
         base_features = [
-            "Salt", "Cs", "fs", "C",
+            "Salt", "Cs", "fs", "Cp",
             "Gamma", "aT_global", "Gamma_Reduced", "Log_Eta_Theory"
         ]
         if self.rheo_cfg.include_raw_T_feature:
             base_features = ["T"] + base_features
 
-        X = df_ml[base_features]
+        X_valid = df_ml.loc[valid_mask, base_features]
 
-        res_pred = self.rheo_ml.predict(X)
-        y_pred_log = df_ml["Log_Eta_Theory"].values + res_pred
+        res_pred = self.rheo_ml.predict(X_valid)
 
-        eta_pred = np.power(10.0, y_pred_log)
+        if bool(getattr(self.rheo_cfg, "use_residual_spike_repair", True)):
+            if int(valid_mask.sum()) >= 3:
+                df_info = df.loc[valid_mask, ["T", "Salt_raw", "Cs", "fs", "Cp", "Gamma"]].copy()
+                res_pred = self._repair_isolated_residual_spikes_for_prediction(
+                    df_info=df_info,
+                    res_pred=res_pred,
+                )
+
+        y_pred_log = df_ml.loc[valid_mask, "Log_Eta_Theory"].values + res_pred
+        eta_pred[valid_mask] = np.power(10.0, y_pred_log)
         return eta_pred
 
     def save(self, path: Path) -> None:
@@ -651,9 +763,12 @@ class RheoHybridModel:
             "rheo_cfg": self.rheo_cfg,
             "encoders": self.encoders,
             "rheo_cy_params": self.rheo_cy_params,
+            "rheo_invalid_formulations": self.rheo_invalid_formulations,
             "rheo_E": self.rheo_E,
             "rheo_Tref0": self.rheo_Tref0,
             "rheo_ml": self.rheo_ml,
+            "rheo_res_clip_low": self.rheo_res_clip_low,
+            "rheo_res_clip_high": self.rheo_res_clip_high,
         }
         joblib.dump(payload, path)
 
@@ -665,9 +780,12 @@ class RheoHybridModel:
 
         model.encoders = payload["encoders"]
         model.rheo_cy_params = payload["rheo_cy_params"]
+        model.rheo_invalid_formulations = payload.get("rheo_invalid_formulations", set())
         model.rheo_E = payload["rheo_E"]
         model.rheo_Tref0 = payload["rheo_Tref0"]
         model.rheo_ml = payload["rheo_ml"]
+        model.rheo_res_clip_low = payload.get("rheo_res_clip_low", None)
+        model.rheo_res_clip_high = payload.get("rheo_res_clip_high", None)
         return model
 
 
@@ -686,7 +804,7 @@ if __name__ == "__main__":
     train_result_path = RESULT_DIR / "Rheo_Train_Result.csv"
     test_result_path = RESULT_DIR / "Rheo_Test_Result.csv"
 
-    # Initialize the model with user-defined settings
+    # Model configuration
     model = RheoHybridModel(
         rheo_cfg=RheoConfig(
             p_eta0_low=1.0,
@@ -706,6 +824,8 @@ if __name__ == "__main__":
             res_floor_apply_Tmin=100.0,
             res_floor_highT=-0.02,
             use_plateau_res_floor=True,
+            use_residual_spike_repair=True,
+            residual_spike_jump_threshold=0.30,
         ),
         verbose=True
     )
@@ -714,23 +834,23 @@ if __name__ == "__main__":
         print(">>> Reading Excel data ...")
         print(f">>> Input file: {rheo_xlsx_path}")
 
-        # Training file has 7 columns: T, Salt, Cs, fs, C, Gamma, Eta
+        # Training file columns: T, Salt, Cs, fs, Cp, Gamma, Eta
         df_rheo_raw = pd.read_excel(rheo_xlsx_path, header=1)
-        df_rheo_raw.columns = ["T", "Salt", "Cs", "fs", "C", "Gamma", "Eta"]
+        df_rheo_raw.columns = ["T", "Salt", "Cs", "fs", "Cp", "Gamma", "Eta"]
 
-        # Step 1: preprocess and save processed data
+        # Step 1: preprocess and save the processed dataset
         df_rheo = model.preprocess_data(df_rheo_raw, save_path=processed_path)
         print(f">>> Number of total modeling samples: {len(df_rheo)}")
 
-        # Step 2: fit physics parameters on all processed training data
+        # Step 2: fit physics parameters on the processed training dataset
         model.fit_physics(df_rheo)
 
-        # Step 3: split data into train/test by formulation group
+        # Step 3: split the dataset into train and test sets by formulation group
         s_salt = df_rheo["Salt"].astype(str)
         s_Cs = df_rheo["Cs"].map(lambda x: f"{float(x):.8g}")
         s_fs = df_rheo["fs"].map(lambda x: f"{float(x):.8g}")
-        s_C = df_rheo["C"].map(lambda x: f"{float(x):.8g}")
-        rheo_groups = s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_C
+        s_Cp = df_rheo["Cp"].map(lambda x: f"{float(x):.8g}")
+        rheo_groups = s_salt + "|" + s_Cs + "|" + s_fs + "|" + s_Cp
 
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=0)
         tr_idx, te_idx = next(gss.split(df_rheo, groups=rheo_groups))
@@ -738,12 +858,12 @@ if __name__ == "__main__":
         df_rheo_train = df_rheo.iloc[tr_idx].reset_index(drop=True)
         df_rheo_test = df_rheo.iloc[te_idx].reset_index(drop=True)
 
-        # Step 4: train the ML residual model
+        # Step 4: train the residual model
         rheo_train_metrics = model.train(df_rheo_train.copy())
 
         # Training-set prediction
         rheo_pred_tr = model.predict(
-            df_rheo_train[["T", "Salt", "Cs", "fs", "C", "Gamma"]].copy()
+            df_rheo_train[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
         )
         df_rheo_train_out = df_rheo_train.copy()
         df_rheo_train_out["Eta_pred"] = rheo_pred_tr
@@ -753,7 +873,7 @@ if __name__ == "__main__":
 
         # Test-set prediction
         rheo_pred_te = model.predict(
-            df_rheo_test[["T", "Salt", "Cs", "fs", "C", "Gamma"]].copy()
+            df_rheo_test[["T", "Salt", "Cs", "fs", "Cp", "Gamma"]].copy()
         )
         rheo_test_metrics = calc_eval_metrics(df_rheo_test["Eta"].values, rheo_pred_te)
 
@@ -796,7 +916,7 @@ if __name__ == "__main__":
         print(f">>> Model saved to: {model_save_path}")
 
         print("\n>>> Training completed.")
-        print(">>> Run predict_generalization_piml.py separately for external prediction.")
+        print(">>> External prediction can be performed with predict_generalization_piml.py.")
 
     except Exception as e:
         import traceback
